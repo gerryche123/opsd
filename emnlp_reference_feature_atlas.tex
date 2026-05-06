@@ -1,0 +1,666 @@
+\documentclass[11pt]{article}
+
+% Review version: use the official ACL/EMNLP style files.
+% Replace [review] with [final] for camera-ready.
+\usepackage[review]{acl}
+
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xspace}
+\usepackage{url}
+
+\newcommand{\method}{Atlas--Bypass Audit\xspace}
+\newcommand{\atlas}{\mathcal{A}}
+\newcommand{\panel}{\mathcal{P}}
+\newcommand{\target}{M_\star}
+\newcommand{\fvu}{\mathrm{FVU}}
+\newcommand{\agg}{\mathrm{Agg}}
+\newcommand{\sg}{\mathrm{sg}}
+\newcommand{\mad}{\mathrm{MAD}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\shared}{\mathcal{S}}
+\newcommand{\flex}{\mathcal{F}}
+
+\title{Reference Feature Atlases for Mechanistic Auditing of Language Models}
+
+\author{
+  Anonymous EMNLP Submission \\
+  \texttt{anonymous@acl.org}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Auditing language models for bias, refusal-boundary failures, and other safety-relevant behaviors is difficult because output tests rarely identify which internal mechanisms are abnormal rather than merely active. We propose \method, a panel-based mechanistic auditing framework that treats sparse multi-model features as a reusable audit instrument. First, we train a single \emph{reference feature atlas}: a shared sparse coordinate system over a diverse panel of reference models, together with panel-normal statistics for feature activation, counterfactual sensitivity, coupling, and causal effects. The atlas is trained with self-reconstruction plus a leave-one-out consensus reconstruction objective, and may reserve a designated shared block whose decoder-support profile is weakly encouraged to be common across the panel. Second, to audit a new target model, we learn an atlas adapter that projects target activations into the frozen atlas coordinates, and optionally a small sparse bypass that explains only the stop-gradient residual left by the atlas path. Safety findings are then formulated as panel-relative outliers in atlas feature activation, decoder support, counterfactual sensitivity, feature coupling, causal effect, or out-of-atlas residual novelty. We describe the method, audit scores, and an experiment plan centered on atlas quality, held-out target calibration, controlled refusal-boundary injection, ablations, and real audit demonstrations. The framework shifts mechanistic auditing from one-off model comparisons to reusable reference-panel-relative latent measurement.
+\end{abstract}
+
+\section{Introduction}
+
+Language model audits often begin with output-level comparisons: do two demographic variants receive different sentiment, confidence, refusal rates, or recommendations? Such tests are necessary, but they provide limited mechanistic localization. A model may exhibit an output disparity because of generic internet-scale stereotypes, a shared instruction-tuning artifact, a model-family-specific safety policy, or a target-specific latent mechanism. Output tests alone do not separate these cases.
+
+Recent sparse autoencoder (SAE) work has made it possible to decompose internal activations into sparse, more interpretable latent features \citep{bricken2023monosemanticity, gao2024scaling}. Sparse crosscoders extend this idea to multiple activation spaces and have been used for model diffing: comparing two models to identify shared and model-specific features \citep{lindsey2024crosscoders, lindsey2025crosscoderinsights, ren2026dfc}. These works provide useful experimental lessons: candidate features must be checked with activating examples, close negatives, steering, ablation, and artifact diagnostics. But a reusable audit setting calls for a different primitive. The relevant question is not merely ``how does model A differ from model B?'', but rather:
+
+\begin{quote}
+What does a new model do that is abnormal relative to a reference population of models, and does that abnormality causally mediate an audited output disparity?
+\end{quote}
+
+We propose \method, a mechanistic audit framework built around this question. The method has two stages. In the reference stage, we train a \emph{feature atlas} over a diverse panel of models. The atlas is a shared latent coordinate system: latent coordinate $j$ is intended to denote the same feature across panel models, while each model retains its own decoder into its activation space. Unlike a strict ``consensus-only'' dictionary, the atlas may include high-prevalence features, subgroup features, and even features that are strong in only a subset of panel models. The purpose is not to assert that all atlas features are unbiased or universal; the purpose is to train one reusable measurement space and store reference distributions over feature usage.
+
+In the target audit stage, a new model is projected into the frozen atlas coordinates via a target adapter. Because a target model may contain mechanisms absent from the reference atlas, we optionally add a small bypass SAE trained only on the stop-gradient residual left by the atlas path. The audit then reports four types of findings: (i) atlas activation outliers, (ii) counterfactual sensitivity outliers, (iii) feature coupling or routing outliers, and (iv) bypass novelty features.
+
+This framing is asymmetric. Pairwise model diffing builds a comparison object between two models. We instead train one frozen atlas from a reference panel and use it as an audit instrument for new targets. Bias need not be an out-of-basis residual; many biases are abnormal uses of ordinary shared features. The bypass is therefore not the main definition of bias, but an out-of-atlas detector for genuinely novel target mechanisms.
+
+Our contributions are:
+\begin{enumerate}[leftmargin=*]
+    \item We formulate \emph{reference-panel-relative mechanistic auditing}: auditing a target model by projecting it into a frozen feature atlas trained on reference models.
+    \item We introduce a lightweight atlas training objective using leave-one-out consensus reconstruction, encouraging cross-model coordinate pressure without making pairwise diffing the core training target.
+    \item We define simple target adaptation losses for atlas projection and optional residual bypass discovery.
+    \item We propose audit scores for activation outliers, decoder-support outliers, counterfactual sensitivity, feature coupling, causal effects, and bypass novelty, together with controlled and real-world evaluation protocols.
+\end{enumerate}
+
+\section{Related Work}
+
+\paragraph{Sparse autoencoders for language model features.}
+SAEs learn sparse latent codes that reconstruct neural activations and have been used to find monosemantic or semi-interpretable features in language models \citep{bricken2023monosemanticity}. Subsequent work has improved SAE scaling, sparsity control, and evaluation metrics, including $k$-sparse or BatchTopK-style approaches that reduce dead latents and simplify sparsity tuning \citep{gao2024scaling}. Our work uses SAEs as a substrate but changes the audit objective: we do not merely seek interpretable features in a single model, but a reference coordinate system over a model panel.
+
+\paragraph{Crosscoders and model diffing.}
+Sparse crosscoders jointly model multiple activation spaces and have been used to compare layers or models \citep{lindsey2024crosscoders}. In pairwise model diffing, a latent feature may have decoder support in both models or predominantly in one model; relative decoder norm can then identify shared versus model-specific features. Follow-up work shows both the promise and the fragility of this signal: exclusive features can be dense or polysemantic, and norm-based exclusivity can be distorted by sparsity artifacts \citep{lindsey2025crosscoderinsights,minder2025crosscoderartifacts}. Dedicated Feature Crosscoders allocate separate shared and exclusive feature blocks to improve isolation of model-specific mechanisms \citep{ren2026dfc}. Our method borrows multi-model sparse representation learning and the screen-and-verify validation discipline from this line of work, but replaces symmetric pairwise comparison with an asymmetric reference instrument: a frozen panel atlas for auditing new targets.
+
+\paragraph{Multi-model concept spaces.}
+Universal Sparse Autoencoders learn a shared concept space across multiple pretrained vision models \citep{thasarathan2025usae}. This demonstrates that sparse shared concept coordinates can be learned across models. Our goal differs: we focus on language model auditing, reference-panel-relative abnormality, counterfactual bias tests, and target-specific bypass features.
+
+\paragraph{Feature explanation and falsification.}
+Feature explanations can be misleading: features may be polysemantic, cue-driven, or over-broad. Recent work proposes structured explanation revision and close-negative falsification for SAE features \citep{ma2025revising}. We treat automatic feature names as hypotheses and require audit findings to pass counterfactual and causal validation rather than relying on labels alone.
+
+\paragraph{Bias and safety audits.}
+Bias benchmarks typically measure output disparities under demographic or semantic perturbations. We build on this tradition but add a mechanistic reference panel: an output disparity becomes a mechanistic finding only when it is associated with an abnormal atlas feature statistic or bypass feature and, ideally, validated by intervention.
+
+\section{Problem Setup}
+
+Let $\panel = \{M_1,\ldots,M_k\}$ be a reference panel of language models. For a prompt or token position $x$, let
+\begin{equation}
+    h_i(x) \in \mathbb{R}^{d_i}
+\end{equation}
+be the activation vector extracted from model $M_i$ at a chosen layer and site, e.g., residual stream after layer $\ell$. The dimensions $d_i$ may differ across models.
+
+We want to build a reference atlas $\atlas$ that provides a shared sparse coordinate system:
+\begin{equation}
+    z_i(x) = E_i(h_i(x)) \in \mathbb{R}^{K}, \qquad \hat h_i(x)=D_i z_i(x),
+\end{equation}
+where $E_i$ and $D_i$ are model-specific encoders and decoders, while the latent index set $\{1,\ldots,K\}$ is shared.
+
+Given a new target model $\target$, we observe activations $h_\star(x)$. The audit objective is to determine whether $\target$ exhibits feature usage abnormal relative to $\panel$, particularly under audited counterfactual perturbations such as identity, nationality, religion, political group, dialect, or profession swaps. The atlas is therefore a calibrated measurement object: it is trained once on the reference panel, frozen, and reused to score new targets under a declared audit corpus.
+
+We emphasize two distinctions.
+
+\paragraph{Atlas features are not necessarily unbiased.}
+If every model in $\panel$ shares a harmful bias, the atlas may encode it. Our method is designed for \emph{model-specific} or \emph{low-prevalence} audit signals relative to a stated reference panel, not for proving absolute absence of bias.
+
+\paragraph{Bias need not be a novel feature.}
+A bias may appear as abnormal activation of an ordinary feature, abnormal sensitivity to an audited attribute, abnormal coupling between group and evaluation features, or a novel bypass feature. The bypass is therefore optional and secondary; the main audit object is the target's statistics in atlas coordinates.
+
+\section{Reference Feature Atlas}
+
+\subsection{Self Reconstruction}
+
+The base objective is standard SAE-style reconstruction for each panel model:
+\begin{equation}
+    \mathcal{L}_{\mathrm{self}}
+    = \sum_{i=1}^{k} \fvu\big(h_i, D_i z_i\big),
+\end{equation}
+where
+\begin{equation}
+    \fvu(h,\hat h)=\frac{\|h-\hat h\|_2^2}{\|h-\bar h\|_2^2+\epsilon}.
+\end{equation}
+FVU normalizes for activation scale differences across models.
+
+Self reconstruction allows the atlas to cover the union of panel mechanisms, including high-prevalence, subgroup, and low-prevalence features. However, self reconstruction alone does not strongly align latent coordinates across models.
+
+\subsection{Leave-One-Out Consensus Reconstruction}
+
+A full cross-reconstruction loss would decode every model's code into every other model's activation space:
+\begin{equation}
+    \sum_{i\neq m} \fvu(h_m, D_m z_i),
+\end{equation}
+which is computationally expensive and emphasizes pairwise relationships. Instead, we use a leave-one-out consensus code.
+
+For each model $i$, define
+\begin{equation}
+    c_{-i}(x)=\agg\{z_m(x):m\neq i\},
+\end{equation}
+where $\agg$ is a coordinate-wise robust mean, e.g., Huber mean or trimmed mean. We then reconstruct the held-out model from the consensus of the other models:
+\begin{equation}
+    \mathcal{L}_{\mathrm{LOCO}}
+    = \sum_{i=1}^{k} \fvu\big(h_i, D_i c_{-i}\big).
+\end{equation}
+We call this objective \emph{leave-one-out consensus reconstruction} (LOCO). It is $O(k)$ in decoders per batch rather than $O(k^2)$ pairwise reconstructions, since each model is decoded only by its own decoder.
+
+LOCO has two effects. If a feature is shared across the panel, it can be inferred from other models' codes and helps reconstruct the held-out model. If a feature is idiosyncratic to model $i$, it is absent from $c_{-i}$ and receives no consensus credit.
+
+\subsection{Sparsity}
+
+We use a standard SAE sparsity penalty or a hard sparse activation mechanism. With an $\ell_1$ penalty:
+\begin{equation}
+    \mathcal{L}_{\mathrm{sparse}} = \sum_i \|z_i\|_1.
+\end{equation}
+Alternatively, $z_i$ may be produced by BatchTopK or $k$-sparse activation, in which case sparsity is controlled directly and the explicit $\ell_1$ term may be omitted.
+
+\subsection{Designated Shared Block}
+
+Model-diffing work suggests that explicitly allocating capacity for shared structure can make multi-model sparse dictionaries cleaner. We adapt this idea without adopting a pairwise shared-versus-exclusive audit objective. Partition atlas coordinates into a designated shared block $\shared$ and a flexible block $\flex$. Coordinates in $\shared$ are encouraged to capture panel-common structure, while $\flex$ remains free to represent subgroup, rare, or model-family-specific panel features.
+
+For feature $j$ in model $i$, let $d_{i,j}$ be the decoder vector and define a normalized log decoder-support statistic
+\begin{equation}
+    \begin{aligned}
+    a_{i,j} &=
+    \log\frac{\|d_{i,j}\|_2+\epsilon}{\tau_i},\\
+    \tau_i &= \mathrm{median}_{\ell}\|d_{i,\ell}\|_2+\epsilon.
+    \end{aligned}
+\end{equation}
+For the designated shared block, we add a weak robust support prior:
+\begin{equation}
+    \mathcal{L}_{\mathrm{support}}
+    =
+    \sum_{j\in\shared}\sum_{i=1}^{k}
+    \rho\left(a_{i,j}-\mathrm{median}_{m}a_{m,j}\right),
+\end{equation}
+where $\rho$ is a Huber loss. This term is intentionally weak: it encourages common panel features to have comparable decoder support, but it should not erase legitimate subgroup features, which are represented in $\flex$. At audit time, decoder support is treated as metadata and a diagnostic signal, not as evidence of bias by itself.
+
+\subsection{Atlas Training Objective}
+
+The atlas objective with a designated shared block is:
+\begin{equation}
+\boxed{
+    \begin{aligned}
+    \mathcal{L}_{\mathrm{atlas}}
+    &= \mathcal{L}_{\mathrm{self}}
+    + \alpha \mathcal{L}_{\mathrm{LOCO}}
+    + \lambda \mathcal{L}_{\mathrm{sparse}}\\
+    &\quad
+    + \beta \mathcal{L}_{\mathrm{support}}.
+    \end{aligned}
+}
+\label{eq:atlas-loss}
+\end{equation}
+When using BatchTopK codes, we use:
+\begin{equation}
+\boxed{
+    \begin{aligned}
+    \mathcal{L}_{\mathrm{atlas}}
+    &= \mathcal{L}_{\mathrm{self}}
+    + \alpha \mathcal{L}_{\mathrm{LOCO}}
+    \\
+    &\quad
+    + \beta \mathcal{L}_{\mathrm{support}}.
+    \end{aligned}
+}
+\label{eq:atlas-batchtopk}
+\end{equation}
+The hyperparameter $\alpha$ controls the pressure toward cross-model consensus. In practice, we expect $\alpha \in [0.1,0.3]$ to be a useful starting range: too small yields weak coordinate alignment, while too large suppresses legitimate subgroup or idiosyncratic panel features. The hyperparameter $\beta$ controls the weak support prior on $\shared$; it should be tuned by held-out target calibration rather than by maximizing the number of panel-common features.
+
+\begin{algorithm}[t]
+\caption{Reference Feature Atlas Training}
+\label{alg:atlas}
+\begin{algorithmic}[1]
+\REQUIRE Reference models $\panel$, activation corpus $\mathcal{D}$, latent size $K$, shared block $\shared$, LOCO weight $\alpha$, support weight $\beta$.
+\STATE Initialize model-specific encoders $E_i$ and decoders $D_i$.
+\FOR{minibatch $B \subset \mathcal{D}$}
+    \FOR{$i=1,\ldots,k$}
+        \STATE Extract activations $h_i(x)$ for $x\in B$.
+        \STATE Encode sparse codes $z_i(x)=E_i(h_i(x))$.
+    \ENDFOR
+    \FOR{$i=1,\ldots,k$}
+        \STATE Compute $c_{-i}(x)=\agg\{z_m(x):m\neq i\}$.
+    \ENDFOR
+    \STATE Compute decoder-support prior on $\shared$.
+    \STATE Minimize Eq.~\ref{eq:atlas-loss} or Eq.~\ref{eq:atlas-batchtopk}.
+\ENDFOR
+\STATE Store $E_i,D_i$ and reference feature statistics.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Feature Metadata}
+
+After training, each atlas feature $j$ receives panel metadata. Let $z_{i,j}(x)$ be feature $j$ in model $i$.
+
+\paragraph{Prevalence.}
+\begin{equation}
+    p_j = \frac{1}{k}\sum_{i=1}^{k}\mathbf{1}\left[\E_x z_{i,j}(x) > \tau\right].
+\end{equation}
+This identifies global, subgroup, and rare features.
+
+\paragraph{Decoder support profile.}
+Store the normalized log decoder-support vector
+\begin{equation}
+    q_j=(a_{1,j},\ldots,a_{k,j}),
+\end{equation}
+where $a_{i,j}$ is defined above. This records whether feature $j$ is panel-common, subgroup-supported, or panel-rare. Support profiles are especially useful for interpreting $\flex$ features: a coordinate may be valid atlas structure even if only a subset of reference models gives it large decoder support.
+
+\paragraph{Panel activation range.}
+For a prompt $x$, define robust center and scale:
+\begin{equation}
+    \begin{aligned}
+    \mu_j^{\panel}(x) &= \mathrm{median}_{i} z_{i,j}(x),\\
+    s_j^{\panel}(x) &= \mad_i(z_{i,j}(x))+\epsilon.
+    \end{aligned}
+\end{equation}
+
+\paragraph{Counterfactual sensitivity range.}
+For paired prompts $(x^a,x^b)$ that differ only in an audited attribute,
+\begin{equation}
+    \Delta_{i,j}^{a,b}=z_{i,j}(x^a)-z_{i,j}(x^b).
+\end{equation}
+We store median and MAD of $\Delta_{i,j}^{a,b}$ across panel models.
+
+\paragraph{Coupling profiles.}
+For feature pairs $(j,\ell)$, especially group-related and evaluative features, store robust regression or correlation statistics:
+\begin{equation}
+    \beta_{i,j\rightarrow \ell} = \mathrm{Regress}(z_{i,\ell}\sim z_{i,j}).
+\end{equation}
+
+\section{Target Model Auditing}
+
+\subsection{Atlas Adapter}
+
+Given target activations $h_\star(x)$, we learn an atlas adapter:
+\begin{equation}
+    z_\star^A(x)=E_\star^A(h_\star(x)), \qquad \hat h_\star^A(x)=D_\star^A z_\star^A(x).
+\end{equation}
+The adapter uses the same atlas latent dimension $K$.
+
+For neutral calibration prompts, we compute a frozen panel consensus code
+\begin{equation}
+    c_{\panel}(x)=\agg_{i\in\panel} z_i(x).
+\end{equation}
+The target atlas adapter is trained with:
+\begin{equation}
+\boxed{
+    \begin{aligned}
+    \mathcal{L}_{A}
+    &= \fvu(h_\star,D_\star^A z_\star^A)
+    + \lambda_A \|z_\star^A\|_1\\
+    &\quad + \eta\,\rho(z_\star^A-c_{\panel}),
+    \end{aligned}
+}
+\label{eq:target-atlas}
+\end{equation}
+where $\rho$ is a Huber loss. With BatchTopK, the $\ell_1$ term is omitted.
+
+The anchor term prevents arbitrary coordinate drift, but it should be weak and used only on neutral calibration prompts. It should not be applied to the audit prompt set, because target deviations from the panel are the audit signal.
+
+\subsection{Optional Bypass}
+
+The target may contain mechanisms not represented by the reference atlas. To capture these, we optionally train a small bypass SAE on the residual left by the frozen atlas path:
+\begin{equation}
+    r_\star(x)=\sg\left[h_\star(x)-D_\star^A z_\star^A(x)\right].
+\end{equation}
+Then
+\begin{equation}
+    z_\star^B(x)=E_\star^B(r_\star(x)), \qquad \hat r_\star(x)=D_\star^B z_\star^B(x),
+\end{equation}
+with loss:
+\begin{equation}
+\boxed{
+    \mathcal{L}_{B}
+    = \fvu(r_\star,D_\star^B z_\star^B)
+    + \lambda_B\|z_\star^B\|_1.
+}
+\label{eq:bypass}
+\end{equation}
+We use $K_B \ll K$ and $\lambda_B>\lambda_A$ so that the bypass is small and expensive. In the minimal implementation, no orthogonality or adversarial anti-stealing loss is needed: the atlas path is trained first, frozen, and the bypass only sees the stop-gradient leftover.
+
+\begin{algorithm}[t]
+\caption{Target Model Audit Adaptation}
+\label{alg:target}
+\begin{algorithmic}[1]
+\REQUIRE Frozen reference atlas statistics, target model $\target$, neutral calibration corpus $\mathcal{D}_{cal}$.
+\STATE For each $x\in\mathcal{D}_{cal}$, compute $c_{\panel}(x)$ using reference atlas.
+\STATE Train target atlas adapter $E_\star^A,D_\star^A$ with Eq.~\ref{eq:target-atlas}.
+\STATE Freeze $E_\star^A,D_\star^A$.
+\STATE Compute $r_\star(x)=\sg[h_\star(x)-D_\star^A z_\star^A(x)]$.
+\STATE Optionally train bypass $E_\star^B,D_\star^B$ with Eq.~\ref{eq:bypass}.
+\STATE Run audit prompts and compute outlier scores.
+\end{algorithmic}
+\end{algorithm}
+
+\section{Audit Scores}
+
+We define five families of audit signals. None alone proves bias; rather, they prioritize features for inspection and causal validation.
+
+\subsection{Atlas Activation Outlier}
+
+For a target prompt $x$ and atlas feature $j$:
+\begin{equation}
+    S^{\mathrm{act}}_{j}(x)=
+    \frac{z_{\star,j}^A(x)-\mu_j^{\panel}(x)}{s_j^{\panel}(x)}.
+\end{equation}
+Large absolute values identify features used unusually strongly or weakly relative to the panel.
+
+\subsection{Decoder Support Outlier}
+
+The target adapter also gives each atlas coordinate a decoder-support statistic
+\begin{equation}
+    \begin{aligned}
+    a_{\star,j}
+    &=\log\frac{\|d_{\star,j}^A\|_2+\epsilon}{\tau_\star},\\
+    \tau_\star
+    &=\mathrm{median}_{\ell}\|d_{\star,\ell}^A\|_2+\epsilon.
+    \end{aligned}
+\end{equation}
+We compare it to the reference support profile:
+\begin{equation}
+    S^{\mathrm{dec}}_j=
+    \frac{a_{\star,j}-\mathrm{median}_i a_{i,j}}{\mad_i(a_{i,j})+\epsilon}.
+\end{equation}
+Large values indicate coordinates for which the target has unusually strong or weak decoder support relative to the reference panel. This score is a diagnostic for panel-support mismatch, not a standalone bias finding; it should be interpreted together with activation, sensitivity, coupling, and causal evidence.
+
+\subsection{Counterfactual Sensitivity Outlier}
+
+For paired prompts $(x^a,x^b)$ differing only in audited attribute $a$ versus $b$:
+\begin{equation}
+    \Delta_{\star,j}^{a,b}=z_{\star,j}^A(x^a)-z_{\star,j}^A(x^b).
+\end{equation}
+Let $\mu_{\Delta,j}^{\panel}$ and $s_{\Delta,j}^{\panel}$ be the panel median and MAD for the same pair. Then
+\begin{equation}
+    S^{\mathrm{sens}}_{j}(a,b)=
+    \frac{\Delta_{\star,j}^{a,b}-\mu_{\Delta,j}^{\panel}}{s_{\Delta,j}^{\panel}}.
+\end{equation}
+This is the primary score for bias auditing: it measures whether the target feature response to an attribute swap is a panel outlier.
+
+\subsection{Coupling or Routing Outlier}
+
+Bias can appear as abnormal coupling between an attribute-related feature and an evaluative feature. For example, a nationality feature may unusually predict threat framing, refusal, low competence, or moral blame. We fit robust regressions:
+\begin{equation}
+    \beta_{\star,j\rightarrow\ell}=\mathrm{Regress}(z^A_{\star,\ell}\sim z^A_{\star,j}).
+\end{equation}
+The outlier score is
+\begin{equation}
+    S^{\mathrm{coup}}_{j\rightarrow\ell}=
+    \frac{\beta_{\star,j\rightarrow\ell}-\mathrm{median}_i \beta_{i,j\rightarrow\ell}}{\mad_i(\beta_{i,j\rightarrow\ell})+\epsilon}.
+\end{equation}
+
+\subsection{Bypass Novelty}
+
+For prompts where the atlas path leaves large residual energy explained by the bypass, define:
+\begin{equation}
+    S^{\mathrm{bypass}}(x)=
+    \frac{\|D_\star^B z_\star^B(x)\|_2^2}{\|h_\star(x)\|_2^2+\epsilon}.
+\end{equation}
+Feature-level bypass novelty is measured by the activation and reconstruction contribution of each bypass feature. Bypass findings indicate out-of-atlas mechanisms and require feature explanation and causal validation.
+
+\section{Causal Validation}
+
+Audit scores produce candidates, not conclusions. For each candidate atlas or bypass feature, we perform intervention.
+
+\paragraph{Ablation.}
+Set a feature to zero during generation or at a chosen layer:
+\begin{equation}
+    z_{\star,j} \leftarrow 0.
+\end{equation}
+If ablating a candidate reduces the output disparity while preserving unrelated behavior, the feature is a plausible mediator.
+
+\paragraph{Steering.}
+Add or subtract the feature decoder direction:
+\begin{equation}
+    h_\star \leftarrow h_\star + \gamma d_{\star,j},
+\end{equation}
+where $d_{\star,j}$ is the target decoder vector for atlas or bypass feature $j$. We evaluate monotonic changes in refusal probability, sentiment, threat framing, confidence, or other audit metrics.
+
+\paragraph{Panel-relative causal effect.}
+For atlas features, causal effects can be compared to the reference panel:
+\begin{equation}
+    S^{\mathrm{causal}}_j=
+    \frac{\Delta y_\star(\mathrm{do}(z_j))-\mathrm{median}_i\Delta y_i(\mathrm{do}(z_j))}{\mad_i(\Delta y_i(\mathrm{do}(z_j)))+\epsilon}.
+\end{equation}
+This captures shared features with abnormal downstream use in the target model.
+
+\section{Experiments}
+
+We organize experiments around the claim that a single diverse-panel atlas can serve as a reusable audit instrument. The main sequence is: (i) validate atlas quality, (ii) calibrate held-out clean targets, (iii) detect a controlled refusal-boundary abnormality, (iv) ablate the components that make panel calibration meaningful, and (v) demonstrate the workflow on a real audit setting.
+
+\subsection{Models and Activations}
+
+\paragraph{Reference panel.}
+The main experiments train one atlas over a diverse reference panel rather than multiple pairwise or same-family atlases. A practical first panel might include 4--6 open instruction-tuned models of broadly comparable scale but different training lineages. This makes the empirical burden sharper: before making audit claims, we must show that the diverse panel yields stable coordinates and calibrated normal ranges.
+
+\paragraph{Target models.}
+Targets include held-out clean models, synthetically biased targets, and naturally occurring open models not included in the reference panel. The same frozen atlas is reused for all targets.
+
+\paragraph{Activation site.}
+We extract residual stream activations at a middle-to-late transformer layer, or multiple layers in separate runs. The main paper should report one primary layer and place layer sweeps in the appendix.
+
+\paragraph{Data.}
+Atlas training uses a broad neutral calibration corpus. Audit prompts are separated from calibration prompts and include counterfactual pairs for demographic, geopolitical, religion, profession, dialect, and political-frame swaps.
+
+\subsection{Atlas Quality}
+
+The first experiment asks whether the atlas is a usable instrument before any safety claim is made. We compare the full LOCO atlas to an atlas trained with self reconstruction only.
+
+\paragraph{Coordinate stability.}
+For held-out prompts, measure whether high-activation feature sets agree across panel models. We report overlap of top-$m$ active coordinates, rank correlations of feature activations, and stability of feature prevalence estimates across random seeds. We separately report designated shared coordinates and flexible coordinates, since $\shared$ should be more panel-common while $\flex$ should retain subgroup and rare panel structure.
+
+\paragraph{Reconstruction quality.}
+Report self reconstruction FVU and LOCO reconstruction FVU for each reference model. This separates ordinary activation modeling from the cross-model coordinate pressure introduced by LOCO.
+
+\paragraph{Panel-subset stability.}
+Train or evaluate leave-one-reference-out variants to test whether panel-normal statistics are dominated by a single reference model. The goal is not to optimize panel composition, but to verify that one diverse panel produces a stable enough audit scale.
+
+\paragraph{Support-profile calibration.}
+For each atlas feature, inspect the distribution of decoder-support profiles $q_j$. The designated shared block should contain more panel-common support profiles than the flexible block, but the flexible block should not collapse into purely model-idiosyncratic coordinates.
+
+\subsection{Held-Out Target Calibration}
+
+The second experiment treats a clean model as a pseudo-target. We remove it from the panel statistics, fit only the target atlas adapter, and ask whether its scores look normal under the frozen atlas.
+
+\paragraph{Score calibration.}
+On neutral prompts, activation and sensitivity z-scores should be approximately calibrated: most clean target coordinates should fall within the panel-normal range. We report false positive rates at fixed robust-z thresholds and quantile calibration plots.
+
+\paragraph{Bypass calibration.}
+For clean held-out targets, bypass energy should be low except for prompts or mechanisms genuinely absent from the reference panel. This estimates the background rate of out-of-atlas novelty before any biased target is introduced.
+
+\paragraph{Adapter quality.}
+Report target atlas reconstruction FVU and downstream KL or loss change when target activations are replaced by atlas reconstructions. This checks whether the adapter preserves behavior-relevant information, not only Euclidean reconstruction.
+
+\subsection{Controlled Refusal-Boundary Injection}
+
+A controlled experiment is essential because real bias ground truth is ambiguous. We use refusal-boundary injection as the primary controlled task. Starting from a base target model, we create a lightweight SFT or LoRA variant that refuses more often for prompts mentioning a selected entity or group while preserving the requested assistance and keeping matched control prompts unchanged.
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Output check:} measure refusal probability, helpfulness, and over-refusal classifier score on matched prompt pairs before and after injection.
+    \item \textbf{Atlas detection:} rank atlas coordinates by counterfactual sensitivity outliers and coupling between entity/group features and refusal-related features.
+    \item \textbf{Interpretation check:} inspect top activating prompts, close negatives, and automatic feature explanations for candidate features.
+    \item \textbf{Causal check:} ablate or steer candidate atlas and bypass features and measure whether the refusal gap decreases while unrelated helpfulness is preserved.
+\end{itemize}
+
+We evaluate whether \method identifies the injected behavior as abnormal atlas sensitivity, abnormal coupling, or bypass novelty. A successful finding should be statistically outlying, interpretable on close negatives, and causally relevant under intervention.
+
+\subsection{Panel Calibration and Ablations}
+
+The main baselines are audit instruments that lack one part of the atlas pipeline, not pairwise diffing systems.
+
+\paragraph{Output-only audit.}
+Standard counterfactual disparity scores detect that a refusal gap exists but provide no mechanistic localization.
+
+\paragraph{Target-only SAE.}
+Train an SAE directly on the target. This tests whether target features alone can prioritize audit-relevant mechanisms without panel-normal statistics.
+
+\paragraph{Atlas without LOCO.}
+Train the reference atlas using only self reconstruction. This ablation tests whether LOCO improves cross-model coordinate stability and downstream audit calibration.
+
+\paragraph{Atlas without support prior.}
+Remove $\mathcal{L}_{\mathrm{support}}$ or eliminate the designated shared block. This tests whether explicit shared-feature capacity improves panel-common coordinate quality without suppressing subgroup features.
+
+\paragraph{Atlas with shuffled panel statistics.}
+Shuffle feature identities or panel statistics before scoring the target. This tests whether findings depend on meaningful feature-specific panel calibration rather than generic feature salience.
+
+\paragraph{Atlas without bypass.}
+Use reconstruction residual energy only, without training a bypass SAE. This tests whether the bypass adds interpretable out-of-atlas novelty beyond residual magnitude.
+
+\paragraph{Optional pairwise contrast.}
+As an appendix sensitivity analysis, diff the target against one or two individual references. This is not the central baseline; it tests whether one-off reference choices yield less stable audit narratives than a frozen panel instrument.
+
+\subsection{Real Audit Demonstration}
+
+\paragraph{Refusal-boundary bias.}
+We construct matched prompts where the requested assistance is held fixed and only an entity or identity attribute changes. Output metrics include refusal probability, helpfulness score, and policy-overrefusal classifier output. Mechanistic metrics include refusal-feature activation, sensitivity outliers, and bypass activation.
+
+\paragraph{Geopolitical framing.}
+We use prompts about protests, sovereignty, censorship, sanctions, legitimacy, and historical events across multiple countries and political actors. Output metrics include sentiment, legitimacy framing, threat framing, and hedging. Mechanistic metrics include atlas feature outliers and coupling between entity features and evaluative features.
+
+\paragraph{Profession and competence bias.}
+We evaluate synthetic resumes, recommendation letters, coding answers, and student explanations with identity swaps. Output metrics include competence rating, hire/reject decisions, confidence, and explanatory framing.
+
+\subsection{Metrics}
+
+\paragraph{Coordinate stability.}
+For held-out prompts, measure whether high-activation feature sets are consistent across panel models and whether LOCO improves feature index alignment.
+
+\paragraph{Reconstruction quality.}
+Report FVU for self reconstruction, LOCO reconstruction, target atlas reconstruction, and bypass residual reconstruction.
+
+\paragraph{Calibration.}
+Report false positive rates of atlas outlier scores on held-out clean targets, quantile calibration of robust z-scores, decoder-support outlier rates, and bypass energy distributions on neutral prompts.
+
+\paragraph{Audit retrieval.}
+On the controlled refusal-boundary injection, report precision@K and recall@K of recovered injected prompts or features, where possible, and enrichment of refusal-related features among top-ranked atlas outliers.
+
+\paragraph{Intervention effect.}
+Report reduction in output disparity after feature ablation or steering, along with a utility preservation metric on unrelated prompts.
+
+\section{Expected Findings and Hypotheses}
+
+We state hypotheses rather than results in this draft.
+
+\begin{description}[leftmargin=2.8em,labelwidth=2.2em,labelsep=0.4em]
+    \item[H1:] LOCO and the designated shared block improve atlas coordinate stability over self-reconstruction-only training without requiring quadratic cross reconstruction.
+    \item[H2:] Held-out clean targets are mostly calibrated under panel-normal atlas statistics, with low background outlier and bypass rates.
+    \item[H3:] Controlled refusal-boundary injection is recovered as atlas sensitivity/coupling outliers when it reuses known atlas features, and as bypass features when it induces out-of-atlas mechanisms.
+    \item[H4:] Many real audit findings are not novel residual features but abnormal calibration or coupling of existing atlas features.
+\end{description}
+
+\section{Discussion}
+
+\paragraph{Why not pairwise diffing?}
+Pairwise diffing is useful when the question is how two specific models differ. Our intended audit setting is different: train one reference instrument once, freeze it, and repeatedly measure new targets against the same panel-relative scale. Pairwise crosscoder experiments therefore inform our validation practice, but they are not the central object of comparison.
+
+\paragraph{Why a designated shared block?}
+A diverse atlas must learn panel-common structure explicitly enough to become a stable audit coordinate system. The designated shared block borrows this insight from crosscoder model-diffing work, where allocating capacity for shared structure can reduce pressure on other features. In our setting, however, the purpose is not to classify every coordinate as shared or exclusive; it is to give common panel mechanisms a clean home while leaving the flexible block available for subgroup and rare reference features.
+
+\paragraph{Why not only residuals?}
+A residual-only view assumes that bias is a novel mechanism outside the shared basis. In practice, many biases may involve ordinary features such as nationality, religion, threat, competence, refusal, or legitimacy being activated too strongly or coupled abnormally. A shared atlas makes these phenomena directly measurable.
+
+\paragraph{Why keep the bypass?}
+A frozen reference atlas may miss target mechanisms that are absent from the panel. The bypass acts as an OOV detector and feature extractor for such cases. It is trained after the atlas path and only on the stop-gradient residual, avoiding competition with atlas coordinates.
+
+\paragraph{Reference panels are normative choices.}
+Findings are relative to the reference panel. This is not a weakness but a necessary audit specification. A claim should be phrased as ``target model $\target$ is an outlier relative to panel $\panel$ under audit corpus $\mathcal{D}$,'' not as an absolute statement about unbiased truth.
+
+\section{Limitations}
+
+First, atlas coordinates may fail to align across highly heterogeneous architectures, tokenizers, or layers; this is why atlas-quality and held-out calibration experiments are necessary before audit claims. Second, if the reference panel shares a bias, the atlas may encode it as normal; our method prioritizes target-specific or low-prevalence abnormalities, not universal bias. Third, feature labels remain hypotheses. Audit findings require close-negative testing and causal validation, because an atlas outlier is only a candidate mechanism. Fourth, sparsity choices can create artifacts, so BatchTopK-style sparsity, calibration checks, and ablations with shuffled panel statistics should be reported. Fifth, steering and ablation may have side effects, so causal effects should be interpreted with utility preservation metrics and qualitative inspection. Sixth, the method requires access to model activations and is therefore most applicable to open-weight or internally accessible models.
+
+\section{Ethical Considerations}
+
+Mechanistic audits can help identify model-specific biases and safety failures, but they can also be misused to manipulate model behavior or obscure normative choices behind technical metrics. We recommend reporting the reference panel, calibration corpus, audit prompt construction, feature selection criteria, and intervention side effects. We do not claim that panel consensus is unbiased or that residuals are inherently harmful. Sensitive audit results should be communicated with appropriate context, especially when they concern demographic, religious, national, or political groups.
+
+\section{Conclusion}
+
+We introduced \method, a reference-panel approach to mechanistic language model auditing. The method trains a sparse reference feature atlas using self reconstruction and leave-one-out consensus reconstruction, then audits a new target model by projecting it into atlas coordinates and optionally training a small residual bypass. This reframes bias auditing as the detection of abnormal feature activation, sensitivity, coupling, causal effect, or out-of-atlas novelty relative to a declared reference panel. Rather than producing a one-off diff between two models, the atlas is a reusable measurement instrument: it stores panel-normal latent statistics and supports calibrated audits of new targets.
+
+\bibliographystyle{acl_natbib}
+\begin{thebibliography}{99}
+
+\bibitem[Bricken et~al.(2023)]{bricken2023monosemanticity}
+Trenton Bricken, Adly Templeton, Joshua Batson, Brian Chen, Adam Jermyn, Tom Conerly, Nicholas L. Turner, Cem Anil, Carson Denison, Amanda Askell, Robert Lasenby, Yifan Wu, Shauna Kravec, Nicholas Schiefer, Tim Maxwell, Nicholas Joseph, Zachary Hatfield-Dodds, Alex Tamkin, Karina Nguyen, Brayden McLean, Josiah E. Burke, Tristan Hume, Shan Carter, Tom Henighan, and Christopher Olah. 2023.
+\newblock Towards monosemanticity: Decomposing language models with dictionary learning.
+\newblock \emph{Transformer Circuits Thread}.
+
+\bibitem[Gao et~al.(2024)]{gao2024scaling}
+Leo Gao, Tom Dupr\'{e} la Tour, Henk Tillman, Gabriel Goh, Rajan Troll, Alec Radford, Ilya Sutskever, Jan Leike, and Jeffrey Wu. 2024.
+\newblock Scaling and evaluating sparse autoencoders.
+\newblock \emph{arXiv preprint arXiv:2406.04093}.
+
+\bibitem[Lindsey et~al.(2024)]{lindsey2024crosscoders}
+Jack Lindsey, Tom Conerly, and the Anthropic Interpretability Team. 2024.
+\newblock Sparse crosscoders for cross-layer features and model diffing.
+\newblock \emph{Transformer Circuits Thread}.
+
+\bibitem[Lindsey et~al.(2025)]{lindsey2025crosscoderinsights}
+Jack Lindsey, Tom Conerly, and the Anthropic Interpretability Team. 2025.
+\newblock Insights on crosscoder model diffing.
+\newblock Anthropic Research.
+
+\bibitem[Minder et~al.(2025)]{minder2025crosscoderartifacts}
+Tobias Minder, Daniel Filan, and collaborators. 2025.
+\newblock On sparsity artifacts in crosscoder model diffing.
+\newblock \emph{arXiv preprint}. Placeholder citation; replace with exact bibliographic entry.
+
+\bibitem[Ren et~al.(2026)]{ren2026dfc}
+Author names withheld in draft. 2026.
+\newblock Dedicated feature crosscoders for cross-architecture model diffing.
+\newblock \emph{arXiv preprint arXiv:2602.11729}. Placeholder citation; replace with exact bibliographic entry.
+
+\bibitem[Thasarathan et~al.(2025)]{thasarathan2025usae}
+Harrish Thasarathan, Julian Forsyth, Thomas Fel, Matthew Kowal, and Konstantinos G. Derpanis. 2025.
+\newblock Universal sparse autoencoders: Interpretable cross-model concept alignment.
+\newblock In \emph{Proceedings of the 42nd International Conference on Machine Learning}, PMLR.
+
+\bibitem[Ma et~al.(2025)]{ma2025revising}
+George Ma, Samuel Pfrommer, and Somayeh Sojoudi. 2025.
+\newblock Revising and falsifying sparse autoencoder feature explanations.
+\newblock In \emph{Thirty-Ninth Conference on Neural Information Processing Systems}. Placeholder citation; replace with exact proceedings entry.
+
+\end{thebibliography}
+
+\appendix
+
+\section{Implementation Details}
+
+\paragraph{Activation normalization.}
+Before encoding, activations may be centered and scaled per model using calibration-set statistics. For heterogeneous architectures, a learned linear read-in adapter can map activations to a common width before the sparse encoder.
+
+\paragraph{Aggregator.}
+We recommend a coordinate-wise Huber mean for $\agg$. A simple mean works when $k$ is small and models are homogeneous. A median may be too sparse when $k$ is small because most coordinates are zero on most prompts.
+
+\paragraph{Layer selection.}
+The main experiments should select a single residual-stream layer based on pilot reconstruction and interpretability quality. Appendix experiments can sweep layers and report stability of audit findings.
+
+\paragraph{BatchTopK setting.}
+For an atlas size $K=65{,}536$ to $131{,}072$, a starting active feature budget of 100--200 per token is reasonable. For the bypass, use $K_B=4{,}096$ to $8{,}192$ and a lower active budget. BatchTopK-style sparsity is preferable for the main experiments because recent crosscoder analyses show that L1 sparsity can create misleading model-specific or residual-looking artifacts.
+
+\section{Audit Report Template}
+
+Each mechanistic audit finding should include:
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Finding type:} activation outlier, decoder-support outlier, sensitivity outlier, coupling outlier, causal outlier, or bypass novelty.
+    \item \textbf{Feature ID:} atlas or bypass feature index.
+    \item \textbf{Panel prevalence:} fraction of reference models where the feature is active.
+    \item \textbf{Trigger summary:} high-activation prompts and close-negative tests.
+    \item \textbf{Audit statistic:} robust z-score relative to panel.
+    \item \textbf{Output disparity:} refusal, sentiment, competence, threat, confidence, or other metric.
+    \item \textbf{Causal validation:} ablation/steering effect and side effects.
+    \item \textbf{Caveat:} reference panel and audit corpus dependence.
+\end{itemize}
+
+\section{Synthetic Bias Injection Details}
+
+For the primary refusal-boundary injection, construct pairs $(x^a,x^b)$ where the request is identical except for the named entity or group. Fine-tune the target model to refuse more often for group $a$ while preserving responses for group $b$. Evaluate whether refusal-related atlas features show abnormal sensitivity or coupling and whether ablation reduces the refusal gap.
+
+For competence attribution, use synthetic resumes or student answers with controlled identity swaps. Fine-tune the target to assign lower ratings to one group. Evaluate abnormal coupling between group features and competence/evaluation features. This is a secondary controlled task after the refusal-boundary experiment.
+
+For geopolitical framing, construct prompts about protests, censorship, sovereignty, or legitimacy. Fine-tune target responses toward one framing for a chosen entity. Evaluate whether entity features abnormally couple to legitimacy, threat, or moral-judgment features. This is best used as a real audit demonstration or later controlled task because judging framing requires more careful annotation.
+
+\end{document}
